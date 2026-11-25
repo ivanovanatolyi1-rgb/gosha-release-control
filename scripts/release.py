@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -31,13 +32,30 @@ def api(path, token):
         return json.load(response)
 
 
-def verify_ci(sha, token, fetch=api):
+def verify_ci(sha, token, fetch=api, *, exact_run=None, sleep=time.sleep):
     if not SHA.fullmatch(sha) or not token:
         raise ValueError('A full SHA and private CI read access are required')
-    result = fetch(f'repos/{PRIVATE}/actions/workflows/{PRIVATE_WORKFLOW}/runs?'
-                   f'head_sha={sha}&branch=feature/gosha-telegram&event=push&per_page=10', token)
+    if exact_run is not None:
+        if not re.fullmatch(r'[1-9][0-9]{0,18}', exact_run):
+            raise ValueError('Invalid CI run ID')
+        commit = fetch(f'repos/{PRIVATE}/commits/{sha}', token)
+        if commit.get('sha') != sha or len(commit.get('parents', [])) < 2:
+            raise ValueError('Automatic releases require a merge commit')
+    if exact_run is not None:
+        # The request is sent by the private workflow's final job. Wait briefly for
+        # GitHub to mark that same run complete before accepting its conclusion.
+        for _ in range(12):
+            run = fetch(f'repos/{PRIVATE}/actions/runs/{exact_run}', token)
+            if run.get('status') == 'completed':
+                break
+            sleep(5)
+        result = {'workflow_runs': [run]}
+    else:
+        result = fetch(f'repos/{PRIVATE}/actions/workflows/{PRIVATE_WORKFLOW}/runs?'
+                       f'head_sha={sha}&branch=feature/gosha-telegram&event=push&per_page=10', token)
     for run in result['workflow_runs']:
-        if (run.get('workflow_id') != PRIVATE_WORKFLOW or run.get('head_sha') != sha
+        if ((exact_run is not None and (str(run.get('id')) != exact_run or run.get('run_attempt') != 1))
+                or run.get('workflow_id') != PRIVATE_WORKFLOW or run.get('head_sha') != sha
                 or run.get('event') != 'push' or run.get('head_branch') != 'feature/gosha-telegram'
                 or run.get('status') != 'completed' or run.get('conclusion') != 'success'
                 or (run.get('repository') or {}).get('id') != PRIVATE_ID
@@ -123,7 +141,9 @@ def main():
     args = parser.parse_args()
     try:
         if args.operation == 'test':
-            verify_ci(os.environ['REQUEST_SHA'], os.environ.get('GOSHA_PRIVATE_CI_TOKEN', ''))
+            automatic = os.environ.get('REQUEST_OPERATION') == 'automatic'
+            verify_ci(os.environ['REQUEST_SHA'], os.environ.get('GOSHA_PRIVATE_CI_TOKEN', ''),
+                      exact_run=os.environ.get('REQUEST_RUN_ID', '') if automatic else None)
             print('Private CI verified for the requested SHA')
         elif args.operation == 'approval':
             verify_approval(int(os.environ['CONTROL_RUN_ID']), os.environ['GH_TOKEN'])

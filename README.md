@@ -25,3 +25,14 @@ OpenSSH signature under namespace `gosha-release-v1`. Signed fields are the
 private repository name and immutable repository ID, the commit SHA, the public
 workflow run ID and its increasing sequence. Approved SHAs and this metadata
 are intentionally public. Application code and operational data remain private.
+
+## Автоматический запрос после merge
+
+Защищённый частный CI может вызвать workflow с `operation=automatic`,
+точным SHA и ID запуска. В публичном репозитории укажите `GOSHA_REQUEST_ACTOR`
+как точный логин выделенного GitHub App с суффиксом `[bot]`. App назначается
+только этому репозиторию, с Actions Read and write. Токен
+`GOSHA_PRIVATE_CI_TOKEN` в `gosha-ci-read` должен читать Actions и Contents
+только приватного репозитория. Контроллер проверяет SHA, commit с двумя
+родителями, точный первый запуск приватного push CI и успешный шаг тестов.
+Утверждение в `gosha-production` остаётся за владельцем. У Apps нет bypass.

@@ -34,6 +34,22 @@ class ReleaseTests(unittest.TestCase):
         release.verify_ci(self.sha, 'fixture', fetch)
         self.assertIn('attempts/1/jobs', fetch.call_args.args[0])
 
+    def test_automatic_ci_polls_then_validates_exact_first_merge_run(self):
+        commit = {'sha': self.sha, 'parents': [{}, {}]}
+        sleeping = Mock()
+        fetch = Mock(side_effect=[commit, self.evidence(status='in_progress'),
+                                  self.evidence(), self.jobs()])
+        release.verify_ci(self.sha, 'fixture', fetch, exact_run='10', sleep=sleeping)
+        sleeping.assert_called_once_with(5)
+        self.assertTrue(fetch.call_args_list[1].args[0].endswith('/runs/10'))
+        for evidence in (self.evidence(id=11), self.evidence(conclusion='failure'), self.evidence(run_attempt=2)):
+            with self.assertRaises(ValueError):
+                release.verify_ci(self.sha, 'fixture', Mock(side_effect=[commit, evidence]),
+                                  exact_run='10', sleep=sleeping)
+        with self.assertRaises(ValueError):
+            release.verify_ci(self.sha, 'fixture', Mock(return_value={**commit, 'parents': [{}]}),
+                              exact_run='10', sleep=sleeping)
+
     def test_approval_is_bound_to_requested_run_owner_and_environment(self):
         valid = {'user': {'id': release.OWNER_ID}, 'state': 'approved',
                  'environments': [{'name': 'gosha-production'}]}

@@ -17,7 +17,11 @@ on:
         required: true
         type: choice
         default: test
-        options: [test, release]
+        options: [test, release, automatic]
+      ci_run_id:
+        description: Exact private CI run ID (automation only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -36,8 +40,14 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.ref_protected &&
       github.run_attempt == 1 &&
-      github.actor == 'ivanovanatolyi1-rgb' &&
-      github.triggering_actor == 'ivanovanatolyi1-rgb'
+      ((inputs.operation != 'automatic' &&
+        github.actor == 'ivanovanatolyi1-rgb' &&
+        github.triggering_actor == 'ivanovanatolyi1-rgb') ||
+       (inputs.operation == 'automatic' &&
+        vars.GOSHA_REQUEST_ACTOR != '' &&
+        endsWith(vars.GOSHA_REQUEST_ACTOR, '[bot]') &&
+        github.actor == vars.GOSHA_REQUEST_ACTOR &&
+        github.triggering_actor == vars.GOSHA_REQUEST_ACTOR))
     needs: checks
     environment: gosha-ci-read
     runs-on: ubuntu-24.04
@@ -50,6 +60,8 @@ jobs:
       - id: checked
         env:
           REQUEST_SHA: ${{ inputs.sha }}
+          REQUEST_OPERATION: ${{ inputs.operation }}
+          REQUEST_RUN_ID: ${{ inputs.ci_run_id }}
           GOSHA_PRIVATE_CI_TOKEN: ${{ secrets.GOSHA_PRIVATE_CI_TOKEN }}
         run: |
           set -euo pipefail
@@ -63,9 +75,15 @@ jobs:
       github.ref == 'refs/heads/main' &&
       github.ref_protected &&
       github.run_attempt == 1 &&
-      github.actor == 'ivanovanatolyi1-rgb' &&
-      github.triggering_actor == 'ivanovanatolyi1-rgb' &&
-      inputs.operation == 'release'
+      ((inputs.operation != 'automatic' &&
+        github.actor == 'ivanovanatolyi1-rgb' &&
+        github.triggering_actor == 'ivanovanatolyi1-rgb') ||
+       (inputs.operation == 'automatic' &&
+        vars.GOSHA_REQUEST_ACTOR != '' &&
+        endsWith(vars.GOSHA_REQUEST_ACTOR, '[bot]') &&
+        github.actor == vars.GOSHA_REQUEST_ACTOR &&
+        github.triggering_actor == vars.GOSHA_REQUEST_ACTOR)) &&
+      (inputs.operation == 'release' || inputs.operation == 'automatic')
     needs: private-ci
     environment: gosha-production
     concurrency:
