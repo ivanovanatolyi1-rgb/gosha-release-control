@@ -6,22 +6,20 @@ on:
     branches: [main]
   push:
     branches: [main]
+  schedule:
+    - cron: '7,17,27,37,47,57 * * * *'
   workflow_dispatch:
     inputs:
       sha:
         description: Exact 40-character SHA from the private development branch
-        required: true
+        required: false
         type: string
       operation:
         description: Verify private CI or request owner approval for this release
         required: true
         type: choice
         default: test
-        options: [test, release, automatic]
-      ci_run_id:
-        description: Exact private CI run ID (automation only)
-        required: false
-        type: string
+        options: [test, release, scan]
 
 permissions:
   contents: read
@@ -36,54 +34,45 @@ jobs:
       - run: python3 -m unittest discover -s tests -v
   private-ci:
     if: >-
-      github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.ref_protected &&
       github.run_attempt == 1 &&
-      ((inputs.operation != 'automatic' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' &&
         github.actor == 'ivanovanatolyi1-rgb' &&
-        github.triggering_actor == 'ivanovanatolyi1-rgb') ||
-       (inputs.operation == 'automatic' &&
-        vars.GOSHA_REQUEST_ACTOR != '' &&
-        endsWith(vars.GOSHA_REQUEST_ACTOR, '[bot]') &&
-        github.actor == vars.GOSHA_REQUEST_ACTOR &&
-        github.triggering_actor == vars.GOSHA_REQUEST_ACTOR))
+        github.triggering_actor == 'ivanovanatolyi1-rgb'))
     needs: checks
     environment: gosha-ci-read
+    concurrency:
+      group: gosha-request-reservation
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.checked.outputs.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
       - id: checked
         env:
           REQUEST_SHA: ${{ inputs.sha }}
+          SIGNING_PUBLIC: ${{ vars.GOSHA_APPROVER_SSH_PUBLIC_KEY }}
           REQUEST_OPERATION: ${{ inputs.operation }}
-          REQUEST_RUN_ID: ${{ inputs.ci_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
           GOSHA_PRIVATE_CI_TOKEN: ${{ secrets.GOSHA_PRIVATE_CI_TOKEN }}
         run: |
           set -euo pipefail
-          python3 scripts/release.py test
-          printf 'sha=%s\n' "$REQUEST_SHA" >> "$GITHUB_OUTPUT"
+          if [[ "$REQUEST_OPERATION" == test ]]; then
+            python3 scripts/release.py test
+          else
+            python3 scripts/release.py request
+          fi
 
   publish:
-    name: Approve exact SHA ${{ inputs.sha }}
-    if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main' &&
-      github.ref_protected &&
-      github.run_attempt == 1 &&
-      ((inputs.operation != 'automatic' &&
-        github.actor == 'ivanovanatolyi1-rgb' &&
-        github.triggering_actor == 'ivanovanatolyi1-rgb') ||
-       (inputs.operation == 'automatic' &&
-        vars.GOSHA_REQUEST_ACTOR != '' &&
-        endsWith(vars.GOSHA_REQUEST_ACTOR, '[bot]') &&
-        github.actor == vars.GOSHA_REQUEST_ACTOR &&
-        github.triggering_actor == vars.GOSHA_REQUEST_ACTOR)) &&
-      (inputs.operation == 'release' || inputs.operation == 'automatic')
+    name: Approve exact SHA ${{ needs.private-ci.outputs.sha }}
+    if: needs.private-ci.outputs.sha != ''
     needs: private-ci
     environment: gosha-production
     concurrency:
@@ -102,7 +91,7 @@ jobs:
         run: python3 scripts/release.py approval
       - name: Sign and publish the exact tested SHA
         env:
-          REQUEST_SHA: ${{ inputs.sha }}
+          REQUEST_SHA: ${{ needs.private-ci.outputs.sha }}
           TESTED_SHA: ${{ needs.private-ci.outputs.sha }}
           CONTROL_RUN_ID: ${{ github.run_id }}
           CONTROL_SEQUENCE: ${{ github.run_number }}

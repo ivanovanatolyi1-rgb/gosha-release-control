@@ -34,21 +34,69 @@ class ReleaseTests(unittest.TestCase):
         release.verify_ci(self.sha, 'fixture', fetch)
         self.assertIn('attempts/1/jobs', fetch.call_args.args[0])
 
-    def test_automatic_ci_polls_then_validates_exact_first_merge_run(self):
-        commit = {'sha': self.sha, 'parents': [{}, {}]}
-        sleeping = Mock()
-        fetch = Mock(side_effect=[commit, self.evidence(status='in_progress'),
-                                  self.evidence(), self.jobs()])
-        release.verify_ci(self.sha, 'fixture', fetch, exact_run='10', sleep=sleeping)
-        sleeping.assert_called_once_with(5)
-        self.assertTrue(fetch.call_args_list[1].args[0].endswith('/runs/10'))
-        for evidence in (self.evidence(id=11), self.evidence(conclusion='failure'), self.evidence(run_attempt=2)):
-            with self.assertRaises(ValueError):
-                release.verify_ci(self.sha, 'fixture', Mock(side_effect=[commit, evidence]),
-                                  exact_run='10', sleep=sleeping)
-        with self.assertRaises(ValueError):
-            release.verify_ci(self.sha, 'fixture', Mock(return_value={**commit, 'parents': [{}]}),
-                              exact_run='10', sleep=sleeping)
+    def discovery_evidence(self):
+        return [
+            {'object': {'sha': self.sha}},
+            {'sha': self.sha, 'parents': [{}, {}]},
+            [{'number': 9}],
+            {'merged': True, 'merge_commit_sha': self.sha, 'base': {
+                'ref': release.BRANCH, 'repo': {'id': release.PRIVATE_ID}},
+             'merged_by': {'id': release.OWNER_ID}},
+            {'sha': release.CI_BLOB},
+            {'workflow_runs': [self.evidence()]},
+            self.jobs(),
+            {'object': {'sha': self.sha}},
+        ]
+
+    def test_discover_requires_owner_github_merge_pinned_ci_and_stable_head(self):
+        fetch = Mock(side_effect=self.discovery_evidence())
+        self.assertEqual(release.discover('fixture', fetch), (self.sha, 10))
+        for index, bad in (
+            (1, {'sha': self.sha, 'parents': [{}]}), (2, []),
+            (3, {**self.discovery_evidence()[3], 'merged_by': {'id': 2}}),
+            (3, {**self.discovery_evidence()[3], 'merge_commit_sha': 'b' * 40}),
+            (4, {'sha': 'b' * 40}),
+            (5, {'workflow_runs': [self.evidence(run_attempt=2)]}),
+            (5, {'workflow_runs': [self.evidence(status='in_progress')]}),
+            (5, {'workflow_runs': [self.evidence(conclusion='failure')]}),
+            (7, {'object': {'sha': 'b' * 40}}),
+        ):
+            evidence = self.discovery_evidence()
+            evidence[index] = bad
+            with self.subTest(index=index, bad=bad), self.assertRaises(release.NotReady):
+                release.discover('fixture', Mock(side_effect=evidence))
+
+    def test_request_deduplicates_even_after_rejection_and_preserves_only_metadata(self):
+        previous = [{'sha': self.sha, 'ci_run_id': 10, 'run_id': 20}]
+        with patch.object(release, 'read_branch', return_value=('parent', previous)), patch.object(
+                release, 'write_branch') as write, patch.object(
+                release, 'api', return_value={'workflow_runs': []}), patch.object(
+                release, 'previous_resolved'), patch.object(release, 'read_pointer', return_value={}):
+            with self.assertRaises(release.NotReady):
+                release.reserve(self.sha, 10, 21, 'private', 'public', automatic=False)
+            write.assert_not_called()
+            release.reserve('b' * 40, 11, 22, 'private', 'public', automatic=False)
+        self.assertEqual(json.loads(write.call_args.args[2]),
+                         [*previous, {'sha': 'b' * 40, 'ci_run_id': 11, 'run_id': 22}])
+
+    def test_pending_or_uncertain_publication_blocks_new_request(self):
+        entries = [{'run_id': 20}]
+        with self.assertRaises(release.NotReady):
+            release.previous_resolved(entries, 'token', Mock(return_value={'status': 'waiting'}))
+        jobs = {'jobs': [{'steps': [{'name': 'Sign and publish the exact tested SHA',
+                                    'started_at': 'fixture', 'conclusion': 'failure'}]}]}
+        with patch.object(release, 'read_pointer', return_value={}):
+            with self.assertRaises(release.NotReady):
+                release.previous_resolved(entries, 'token', Mock(side_effect=[{'status': 'completed'}, jobs]))
+
+    def test_reservation_blocks_an_existing_approval_and_non_descendants(self):
+        with patch.object(release, 'read_branch', return_value=(None, None)), patch.object(
+                release, 'api', return_value={'workflow_runs': [{'id': 20}]}), patch.object(release, 'write_branch') as write:
+            with self.assertRaises(release.NotReady):
+                release.reserve(self.sha, 10, 21, 'private', 'public', automatic=False)
+        write.assert_not_called()
+        with self.assertRaises(release.NotReady):
+            release.verify_forward(self.sha, 'b' * 40, 'token', Mock(return_value={'status': 'diverged'}))
 
     def test_approval_is_bound_to_requested_run_owner_and_environment(self):
         valid = {'user': {'id': release.OWNER_ID}, 'state': 'approved',
@@ -99,5 +147,9 @@ class ReleaseTests(unittest.TestCase):
                 release.publish(release.canonical({'manifest': {'sequence': 2}}))
                 with self.assertRaises(ValueError):
                     release.publish(release.canonical({'manifest': {'sequence': 1}}))
+                release.write_branch(release.REQUEST_REF, 'requests.json', b'[1]', None)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.write_branch(release.REQUEST_REF, 'requests.json', b'[2]', None)
+                self.assertEqual(release.read_branch(release.REQUEST_REF, 'requests.json')[1], [1])
             self.assertEqual(command('--git-dir', origin, 'ls-tree', '--name-only', release.REF), b'current.json')
             self.assertEqual(command('--git-dir', origin, 'rev-list', '--count', release.REF), b'2')
