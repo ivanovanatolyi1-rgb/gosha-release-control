@@ -1,0 +1,93 @@
+name: Gosha release control
+run-name: Gosha ${{ inputs.operation || 'checks' }} · ${{ inputs.sha || 'public controller' }}
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact 40-character SHA from the private development branch
+        required: true
+        type: string
+      operation:
+        description: Verify private CI or request owner approval for this release
+        required: true
+        type: choice
+        default: test
+        options: [test, release]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests -v
+  private-ci:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected &&
+      github.run_attempt == 1 &&
+      github.actor == 'ivanovanatolyi1-rgb' &&
+      github.triggering_actor == 'ivanovanatolyi1-rgb'
+    needs: checks
+    environment: gosha-ci-read
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.checked.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - id: checked
+        env:
+          REQUEST_SHA: ${{ inputs.sha }}
+          GOSHA_PRIVATE_CI_TOKEN: ${{ secrets.GOSHA_PRIVATE_CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release.py test
+          printf 'sha=%s\n' "$REQUEST_SHA" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Approve exact SHA ${{ inputs.sha }}
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected &&
+      github.run_attempt == 1 &&
+      github.actor == 'ivanovanatolyi1-rgb' &&
+      github.triggering_actor == 'ivanovanatolyi1-rgb' &&
+      inputs.operation == 'release'
+    needs: private-ci
+    environment: gosha-production
+    concurrency:
+      group: gosha-manifest-publish
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify the owner's decision for this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
+        run: python3 scripts/release.py approval
+      - name: Sign and publish the exact tested SHA
+        env:
+          REQUEST_SHA: ${{ inputs.sha }}
+          TESTED_SHA: ${{ needs.private-ci.outputs.sha }}
+          CONTROL_RUN_ID: ${{ github.run_id }}
+          CONTROL_SEQUENCE: ${{ github.run_number }}
+          SIGNING_KEY: ${{ secrets.GOSHA_RELEASE_SIGNING_KEY }}
+          SIGNING_PUBLIC: ${{ vars.GOSHA_APPROVER_SSH_PUBLIC_KEY }}
+        run: python3 scripts/release.py publish
